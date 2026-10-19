@@ -1,0 +1,5 @@
+streamlit==1.56.0
+gspread
+google-auth
+Authlib>=1.6.11
+firebase-admin>=6.5.0
