@@ -1,0 +1,23 @@
+{
+  "name": "Nailcraft Agenda",
+  "short_name": "Nailcraft",
+  "description": "Agenda de citas de Nailcraft.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#fff9fd",
+  "theme_color": "#a40ac5",
+  "icons": [
+    {
+      "src": "/app/static/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/app/static/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
