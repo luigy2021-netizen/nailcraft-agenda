@@ -1,1489 +1,351 @@
-import base64
-import json
-from datetime import date, datetime, time, timedelta
-from html import escape
-from pathlib import Path
-from urllib.parse import quote
+from __future__ import annotations
 
-import firebase_admin
+import re
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
+
 import streamlit as st
-from firebase_admin import credentials, firestore
+from firebase_admin import firestore
 
-
-# =====================================================
-# CONFIGURACIÓN GENERAL
-# =====================================================
-
-st.set_page_config(
-    page_title="Nailcraft | Agenda",
-    page_icon="💅",
-    layout="centered",
-    initial_sidebar_state="collapsed",
+from nailcraft.data import (
+    all_salons,
+    appointments_between,
+    available_starts,
+    create_booking_atomic,
+    gallery_change,
+    list_docs,
+    manage_booking,
+    public_salon_by_slug,
+    salon_ref,
+    salons_for_owner,
+    seed_salon,
+    subscription_allows_booking,
+    upsert,
 )
+from nailcraft.media import delete_image, upload_image
 
-BASE_DIR = Path(__file__).parent
+st.set_page_config(page_title="Nail Craft", page_icon="💅", layout="wide")
 
-APP_URL = st.secrets.get(
-    "app_url",
-    "https://nailcraft-agenda.streamlit.app",
-)
-
-WHATSAPP_NEGOCIO = "5216563005504"
-CORREO_DUENO = str(st.secrets.get("owner_email", "")).strip().lower()
-
-SERVICIOS = {"Manicure": 120}
-
-TECNICAS = [
-    "Técnica 1",
-    "Técnica 2",
-    "Técnica 3",
-]
-
-COLECCION_NEGOCIOS = "nailcraft_businesses"
-COLECCION_CITAS = "nailcraft_appointments"
-
-PLANES = {
-    "Starter": [
-        "Agenda personalizada con logo e imagen del negocio",
-        "Bloqueo automático de horarios empalmados",
-        "Comentarios adicionales en cada reservación",
-        "Confirmación de cita por WhatsApp",
-    ],
-    "Business": [
-        "Todo lo incluido en Starter",
-        "Promociones por recomendación",
-        "Enlace directo para compartir tu agenda",
-        "Flyer promocional en el encabezado",
-    ],
-    "Premium": [
-        "Todo lo incluido en Business",
-        "Flyers promocionales nuevos cada mes",
-        "Cancelación y reprogramación de citas",
-        "Bloqueos por vacaciones o días inhábiles",
-        "Administración avanzada de disponibilidad",
-    ],
+STATUS_LABEL = {
+    "booked": "Reservada", "confirmed": "Confirmada", "completed": "Completada",
+    "cancelled_by_client": "Cancelada por clienta", "cancelled_by_salon": "Cancelada por salón",
+    "no_show": "No asistió",
 }
+DAYS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 
-HORA_APERTURA = time(9, 0)
-HORA_CIERRE = time(21, 0)
-DURACION_PRUEBA_DIAS = 15
 
+def qp(name: str, default: str = "") -> str:
+    value = st.query_params.get(name, default)
+    return value[0] if isinstance(value, list) else value
 
-# =====================================================
-# ESTILOS
-# =====================================================
 
-def aplicar_estilos():
-    st.markdown(
-        """
-        <style>
-        @import url(
-            'https://fonts.googleapis.com/css2?'
-            'family=DM+Sans:wght@400;500;600;700&'
-            'family=Space+Grotesk:wght@500;600;700&display=swap'
-        );
+def money(value) -> str:
+    return f"${float(value or 0):,.2f}"
 
-        :root {
-            --bg: #fff9fd;
-            --surface: rgba(255,255,255,.94);
-            --surface-2: #fff4fc;
-            --field: #ffffff;
-            --text: #27152d;
-            --muted: #735f78;
-            --aqua: #b20bd4;
-            --line: rgba(104,26,117,.13);
-        }
 
-        .stApp,
-        [data-testid="stAppViewContainer"],
-        .main {
-            background:
-                radial-gradient(
-                    circle at 50% -10%,
-                    rgba(222,92,206,.16),
-                    transparent 34rem
-                ),
-                var(--bg) !important;
-            color: var(--text) !important;
-            font-family: "DM Sans", sans-serif;
-        }
+def staff_map(salon_id: str):
+    return {x["id"]: x for x in list_docs(salon_id, "staff")}
 
-        #MainMenu, footer, header {
-            visibility: hidden;
-        }
 
-        .block-container {
-            width: 100%;
-            max-width: 430px;
-            padding: .8rem 1rem 5rem !important;
-            margin: 0 auto;
-        }
+def service_map(salon_id: str):
+    return {x["id"]: x for x in list_docs(salon_id, "services")}
 
-        h1, h2, h3 {
-            color: var(--text) !important;
-            font-family: "Space Grotesk", sans-serif !important;
-            letter-spacing: -.035em;
-        }
 
-        h2 {
-            font-size: clamp(1.75rem,5vw,2.35rem) !important;
-            line-height: 1.08 !important;
-        }
+def public_page(slug: str):
+    found = public_salon_by_slug(slug)
+    if not found:
+        st.error("Este salón no existe o el enlace no es correcto.")
+        return
+    salon_id, salon = found
+    st.title(salon.get("name", "Nail Craft"))
+    st.caption("Agenda tu cita en pocos pasos")
+    gallery = sorted(list_docs(salon_id, "gallery"), key=lambda x: x.get("position", 99))
+    if gallery:
+        cols = st.columns(min(5, len(gallery)))
+        for i, item in enumerate(gallery):
+            cols[i % len(cols)].image(item["url"], use_container_width=True)
 
-        p, li, .stCaption {
-            color: var(--muted) !important;
-        }
-
-        .hero img {
-            display: block;
-            width: 100%;
-            border-radius: 26px;
-            border: 1px solid var(--line);
-            box-shadow: 0 24px 70px rgba(100,20,105,.18);
-        }
-
-        .section {
-            margin: 2.7rem 0 1rem;
-        }
-
-        .eyebrow {
-            color: var(--aqua);
-            font-weight: 700;
-            font-size: .72rem;
-            letter-spacing: .13em;
-            text-transform: uppercase;
-            margin-bottom: .5rem;
-        }
-
-        .glass-card,
-        .selected-state,
-        .booking-summary {
-            margin: .9rem 0;
-            padding: 1.15rem 1.2rem;
-            border: 1px solid var(--line);
-            border-radius: 22px;
-            background: var(--surface);
-            box-shadow: 0 18px 50px rgba(100,20,105,.10);
-        }
-
-        .selected-state {
-            padding: .8rem 1rem;
-            color: var(--muted);
-            font-size: .92rem;
-        }
-
-        .selected-state b,
-        .booking-summary strong {
-            color: var(--text);
-        }
-
-        .accent {
-            color: var(--aqua);
-        }
-
-        div[data-testid="stWidgetLabel"] p {
-            color: var(--muted) !important;
-            font-weight: 600 !important;
-        }
-
-        [data-testid="stSelectbox"] div[data-baseweb="select"] > div,
-        [data-testid="stDateInput"] input,
-        [data-testid="stTextInput"] input,
-        [data-testid="stTextArea"] textarea,
-        div[data-baseweb="input"] > div {
-            background-color: var(--field) !important;
-            color: var(--text) !important;
-            border: 1px solid var(--line) !important;
-            border-radius: 15px !important;
-            box-shadow: none !important;
-        }
-
-        [data-testid="stSelectbox"] div[data-baseweb="select"] > div,
-        [data-testid="stDateInput"] input,
-        [data-testid="stTextInput"] input {
-            min-height: 52px !important;
-        }
-
-        [data-testid="stTextArea"] textarea {
-            min-height: 84px !important;
-        }
-
-        div[data-baseweb="popover"],
-        ul[role="listbox"],
-        [role="option"] {
-            background: #ffffff !important;
-            color: var(--text) !important;
-        }
-
-        .stButton > button {
-            min-height: 54px !important;
-            border: 1px solid var(--line) !important;
-            border-radius: 16px !important;
-            background: var(--surface-2) !important;
-            color: var(--text) !important;
-            font-family: "DM Sans", sans-serif !important;
-            font-weight: 650 !important;
-        }
-
-        .stButton > button[kind="primary"] {
-            border-color: transparent !important;
-            background: linear-gradient(135deg,#d823e5,#8b05bd) !important;
-            color: #ffffff !important;
-        }
-
-        [class*="st-key-servicio_"] button {
-            min-height: 72px !important;
-            text-align: left !important;
-            justify-content: flex-start !important;
-        }
-
-        [class*="st-key-hora_"] button {
-            min-height: 44px !important;
-            border-radius: 999px !important;
-            font-size: .86rem !important;
-        }
-
-        [data-testid="stAlert"] {
-            border-radius: 16px !important;
-            border: 1px solid var(--line) !important;
-            background: rgba(255,255,255,.70) !important;
-        }
-
-        .owner-header {
-            padding: 1rem 0 .35rem;
-        }
-
-        .owner-header h1 {
-            margin: 0 !important;
-            font-size: clamp(2rem,8vw,3rem) !important;
-        }
-
-        .metric-card {
-            min-height: 112px;
-            padding: 1rem;
-            border: 1px solid var(--line);
-            border-radius: 20px;
-            background: var(--surface);
-        }
-
-        .metric-card .value {
-            color: var(--text);
-            font-family: "Space Grotesk", sans-serif;
-            font-size: 1.9rem;
-            font-weight: 700;
-        }
-
-        .metric-card .label {
-            color: var(--muted);
-            font-size: .8rem;
-        }
-
-        .appointment-card {
-            margin: .65rem 0;
-            padding: .9rem 1rem;
-            border-left: 3px solid var(--aqua);
-            border-radius: 0 16px 16px 0;
-            background: rgba(255,255,255,.78);
-        }
-
-        .appointment-card strong {
-            color: var(--text);
-        }
-
-        .appointment-card .meta {
-            color: var(--muted);
-            font-size: .84rem;
-        }
-
-        @media (max-width: 640px) {
-            .block-container {
-                max-width: 100%;
-                padding-left: .78rem !important;
-                padding-right: .78rem !important;
-            }
-
-            .hero img {
-                border-radius: 20px;
-            }
-
-            [class*="st-key-plan_"] button {
-                min-height: 50px !important;
-                padding: .25rem !important;
-                font-size: .72rem !important;
-            }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# =====================================================
-# FIREBASE / FIRESTORE
-# =====================================================
-
-@st.cache_resource
-def get_db():
-    contenido = base64.b64decode(
-        str(st.secrets["firebase_service_account_b64"])
-    ).decode("utf-8")
-
-    informacion = json.loads(contenido)
-
-    if not firebase_admin._apps:
-        credencial = credentials.Certificate(informacion)
-        firebase_admin.initialize_app(credencial)
-
-    return firestore.client()
-
-
-def texto_seguro(valor):
-    return escape(str(valor or "").strip())
-
-
-def datos_usuario():
-    if not st.user.is_logged_in:
-        return {}
-
-    return st.user.to_dict()
-
-
-def id_usuario_actual():
-    usuario = datos_usuario()
-    return str(
-        usuario.get("sub")
-        or usuario.get("email")
-        or ""
-    ).strip()
-
-
-def usuario_es_dueno():
-    correo = str(datos_usuario().get("email", "")).strip().lower()
-    return bool(correo) and (
-        not CORREO_DUENO or correo == CORREO_DUENO
-    )
-
-
-def obtener_negocio(negocio_id):
-    if not negocio_id:
-        return None
-
-    documento = (
-        get_db()
-        .collection(COLECCION_NEGOCIOS)
-        .document(negocio_id)
-        .get()
-    )
-
-    if not documento.exists:
-        return None
-
-    negocio = documento.to_dict() or {}
-    negocio["id"] = documento.id
-    return negocio
-
-
-def obtener_negocio_del_dueno():
-    usuario_id = id_usuario_actual()
-
-    if not usuario_id:
-        return None
-
-    return obtener_negocio(usuario_id)
-
-
-def obtener_negocio_publico():
-    documentos = (
-        get_db()
-        .collection(COLECCION_NEGOCIOS)
-        .limit(1)
-        .stream()
-    )
-
-    for documento in documentos:
-        negocio = documento.to_dict() or {}
-        negocio["id"] = documento.id
-        return negocio
-
-    return None
-
-
-def crear_negocio(nombre, celular):
-    usuario = datos_usuario()
-    usuario_id = id_usuario_actual()
-
-    if not usuario_id:
-        raise ValueError("No hay un usuario autenticado.")
-
-    datos = {
-        "owner_uid": usuario_id,
-        "owner_email": str(usuario.get("email", "")).strip(),
-        "owner_name": str(usuario.get("name", "")).strip(),
-        "business_name": nombre.strip(),
-        "phone": celular.strip(),
-        "plan": "Starter",
-        "trial_days": DURACION_PRUEBA_DIAS,
-        "trial_started_at": datetime.now().isoformat(),
-        "trial_ends_at": (
-            datetime.now() + timedelta(days=DURACION_PRUEBA_DIAS)
-        ).isoformat(),
-        "created_at": firestore.SERVER_TIMESTAMP,
-        "active": True,
-    }
-
-    (
-        get_db()
-        .collection(COLECCION_NEGOCIOS)
-        .document(usuario_id)
-        .set(datos)
-    )
-
-
-def dias_prueba_restantes(negocio):
-    valor = str(negocio.get("trial_ends_at", "")).strip()
-    if not valor:
-        return DURACION_PRUEBA_DIAS
-
-    try:
-        termina = datetime.fromisoformat(valor)
-    except ValueError:
-        return DURACION_PRUEBA_DIAS
-
-    diferencia = termina - datetime.now()
-    return max(0, diferencia.days + (1 if diferencia.seconds else 0))
-
-
-def consulta_citas(negocio_id):
-    if not negocio_id:
-        return []
-
-    documentos = (
-        get_db()
-        .collection(COLECCION_CITAS)
-        .where("business_id", "==", negocio_id)
-        .stream()
-    )
-
-    return [documento.to_dict() or {} for documento in documentos]
-
-
-def preparar_cita(cita):
-    fecha_texto = str(cita.get("fecha", ""))
-    hora_texto = str(cita.get("hora", ""))
-
-    try:
-        cita["inicio"] = datetime.strptime(
-            f"{fecha_texto} {hora_texto}",
-            "%Y-%m-%d %I:%M %p",
-        )
-    except (TypeError, ValueError):
-        cita["inicio"] = None
-
-    try:
-        cita["duracion_min"] = int(cita.get("duracion", 0))
-    except (TypeError, ValueError):
-        cita["duracion_min"] = 0
-
-    return cita
-
-
-def obtener_citas(negocio_id):
-    return [
-        preparar_cita(cita)
-        for cita in consulta_citas(negocio_id)
-    ]
-
-
-def guardar_cita(datos):
-    referencia = get_db().collection(COLECCION_CITAS).document()
-
-    datos = dict(datos)
-    datos["id"] = referencia.id
-    datos["created_at"] = firestore.SERVER_TIMESTAMP
-
-    referencia.set(datos)
-    return referencia.id
-
-
-def se_empalma(inicio_a, fin_a, inicio_b, fin_b):
-    return inicio_a < fin_b and inicio_b < fin_a
-
-
-def horarios_disponibles(
-    fecha,
-    duracion,
-    tecnica,
-    negocio_id=None,
-):
-    if fecha.weekday() == 6:
-        return []
-
-    citas = []
-
-    if negocio_id:
-        for cita in obtener_citas(negocio_id):
-            if (
-                cita.get("fecha") == str(fecha)
-                and str(cita.get("estado", "")).lower()
-                != "cancelada"
-                and cita.get("inicio")
-                and cita.get("tecnica") == tecnica
-            ):
-                inicio = cita["inicio"]
-                termino = inicio + timedelta(
-                    minutes=cita["duracion_min"]
-                )
-                citas.append((inicio, termino))
-
-    disponibles = []
-    actual = datetime.combine(fecha, HORA_APERTURA)
-    cierre = datetime.combine(fecha, HORA_CIERRE)
-    ahora = datetime.now()
-
-    while actual < cierre:
-        fin = actual + timedelta(minutes=duracion)
-
-        ocupado = any(
-            se_empalma(actual, fin, inicio, termino)
-            for inicio, termino in citas
-        )
-
-        if (
-            fin <= cierre
-            and actual > ahora
-            and not ocupado
-        ):
-            disponibles.append(actual.strftime("%I:%M %p"))
-
-        actual += timedelta(minutes=30)
-
-    return disponibles
-
-
-def duracion_legible(minutos):
-    if minutos < 60:
-        return f"{minutos} min"
-
-    if minutos == 60:
-        return "1 hora"
-
-    horas = minutos / 60
-
-    if horas.is_integer():
-        return f"{int(horas)} horas"
-
-    return f"{minutos} min"
-
-
-# =====================================================
-# AGENDA PÚBLICA
-# =====================================================
-
-def mostrar_experiencia(negocio=None):
-    negocio_id = negocio.get("id") if negocio else None
-
-    introduccion = (
-        '<div class="eyebrow">Bienvenida a Nailcraft</div>'
-        "<h2>Agenda tu cita y disfruta unas uñas increíbles</h2>"
-        "<p>Lunes a sábado · 9:00 a. m. a 9:00 p. m.</p>"
-    )
-
-    st.markdown(
-        f'<section class="section">{introduccion}</section>',
-        unsafe_allow_html=True,
-    )
-
-    giro = "Salón de uñas"
-    servicios = SERVICIOS
-
-    st.markdown(
-        f'<div class="selected-state">'
-        f'<span class="accent">01</span> &nbsp; '
-        f'<b>Nuestros servicios</b> · Elige el servicio'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-    nombres = list(servicios)
-
-    for i in range(0, len(nombres), 2):
-        columnas = st.columns(2, gap="small")
-
-        for j, servicio_nombre in enumerate(nombres[i:i + 2]):
-            minutos = servicios[servicio_nombre]
-            seleccionado = (
-                st.session_state.get("servicio_demo")
-                == servicio_nombre
-            )
-
-            etiqueta = (
-                f"{'✓  ' if seleccionado else ''}"
-                f"{servicio_nombre}\n"
-                f"{duracion_legible(minutos)}"
-            )
-
-            with columnas[j]:
-                if st.button(
-                    etiqueta,
-                    key=f"servicio_{i + j}",
-                    use_container_width=True,
-                    type=(
-                        "primary"
-                        if seleccionado
-                        else "secondary"
-                    ),
-                ):
-                    st.session_state["servicio_demo"] = (
-                        servicio_nombre
-                    )
-                    st.session_state["hora_demo"] = None
-                    st.rerun()
-
-    servicio = st.session_state.get("servicio_demo")
-
-    if not servicio:
+    if not subscription_allows_booking(salon):
+        phone = salon.get("owner_phone", "")
+        st.warning(f"La agenda en línea está temporalmente pausada. Comunícate con la dueña del salón{f' al {phone}' if phone else ''} para reservar.")
         return
 
-    duracion = servicios[servicio]
-
-    tecnica = st.selectbox(
-        "¿Con quién quieres tu cita?",
-        TECNICAS,
-        key="tecnica_demo",
-    )
-
-    st.markdown(
-        f'<div class="selected-state">'
-        f'<span class="accent">02</span> &nbsp; '
-        f'<b>{texto_seguro(servicio)}</b> · '
-        f'{duracion_legible(duracion)} · Elige el día'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-    fecha = st.date_input(
-        "Fecha de la cita",
-        min_value=date.today(),
-        format="DD/MM/YYYY",
-        key="fecha_demo",
-    )
-
-    fecha_key = str(fecha)
-
-    if st.session_state.get("_ultima_fecha") != fecha_key:
-        st.session_state["_ultima_fecha"] = fecha_key
-        st.session_state["hora_demo"] = None
-
-    try:
-        horas = horarios_disponibles(
-            fecha,
-            duracion,
-            tecnica,
-            negocio_id,
-        )
-    except Exception:
-        st.error(
-            "No fue posible consultar los horarios disponibles."
-        )
+    staff = [x for x in list_docs(salon_id, "staff") if x.get("active", True)]
+    services = service_map(salon_id)
+    if not staff or not services:
+        st.info("Este salón todavía está preparando su agenda.")
         return
 
-    if not horas:
-        if fecha.weekday() == 6:
-            st.warning("Nailcraft permanece cerrado los domingos.")
-        else:
-            st.warning(
-                "Ese día ya no tiene espacios disponibles. "
-                "Prueba otra fecha."
-            )
+    st.subheader("1. Elige a tu colaboradora")
+    labels = {x["id"]: x.get("name", "Colaboradora") for x in staff}
+    chosen_staff_id = st.selectbox("Colaboradora", list(labels), format_func=labels.get)
+    chosen_staff = next(x for x in staff if x["id"] == chosen_staff_id)
+    if chosen_staff.get("photo_url"):
+        st.image(chosen_staff["photo_url"], width=140)
+    eligible = [services[sid] for sid in chosen_staff.get("service_ids", []) if sid in services and services[sid].get("active", True)]
+    if not eligible:
+        st.info("Esta colaboradora aún no tiene servicios disponibles.")
         return
 
-    st.markdown(
-        """
-        <div class="selected-state">
-            <span class="accent">03</span>
-            &nbsp; Elige un horario disponible
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    for i in range(0, len(horas), 3):
-        columnas = st.columns(3, gap="small")
-
-        for j, hora_opcion in enumerate(horas[i:i + 3]):
-            seleccionado = (
-                st.session_state.get("hora_demo")
-                == hora_opcion
-            )
-
-            with columnas[j]:
-                if st.button(
-                    f"{'✓ ' if seleccionado else ''}"
-                    f"{hora_opcion}",
-                    key=f"hora_{i + j}",
-                    use_container_width=True,
-                    type=(
-                        "primary"
-                        if seleccionado
-                        else "secondary"
-                    ),
-                ):
-                    st.session_state["hora_demo"] = hora_opcion
-                    st.rerun()
-
-    hora = st.session_state.get("hora_demo")
-
-    if not hora:
+    st.subheader("2. Elige servicio, día y hora")
+    service_labels = {x["id"]: f"{x['name']} · {money(x['price'])} · {x['duration_minutes']} min" for x in eligible}
+    service_id = st.selectbox("Servicio", list(service_labels), format_func=service_labels.get)
+    service = services[service_id]
+    day = st.date_input("Fecha", min_value=date.today(), max_value=date.today() + timedelta(days=90))
+    starts = available_starts(salon_id, chosen_staff, service, day, salon.get("timezone", "America/Ciudad_Juarez"))
+    if not starts:
+        st.info("No hay horarios disponibles en este día.")
         return
+    chosen_start = st.selectbox("Hora", starts, format_func=lambda x: x.strftime("%I:%M %p"))
 
-    fecha_legible = fecha.strftime("%d/%m/%Y")
-
-    st.markdown(
-        f'<div class="booking-summary">'
-        f'<div class="eyebrow">Tu cita</div>'
-        f'<strong>{texto_seguro(servicio)}</strong><br>'
-        f'<span>{fecha_legible} · '
-        f'<span class="accent">{texto_seguro(hora)}</span> · '
-        f'{duracion_legible(duracion)} · '
-        f'{texto_seguro(tecnica)}</span>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("### Solo faltan tus datos")
-
-    nombre = st.text_input(
-        "Nombre completo",
-        placeholder="Tu nombre",
-        key="nombre_demo",
-    )
-
-    whatsapp = st.text_input(
-        "WhatsApp",
-        max_chars=10,
-        placeholder="10 dígitos",
-        key="whatsapp_demo",
-    )
-
-    comentarios = st.text_area(
-        "Comentarios (opcional)",
-        placeholder="¿Hay algo que el negocio deba saber?",
-        key="comentarios_demo",
-    )
-
-    datos_validos = (
-        bool(nombre.strip())
-        and whatsapp.isdigit()
-        and len(whatsapp) == 10
-    )
-
-    if whatsapp and not (
-        whatsapp.isdigit() and len(whatsapp) == 10
-    ):
-        st.caption("Ingresa los 10 números de tu WhatsApp.")
-
-    enviar = st.button(
-        "Confirmar mi cita",
-        key="agendar_cita",
-        use_container_width=True,
-        disabled=not datos_validos,
-        type="primary",
-    )
-
-    if not enviar:
-        return
-
-    try:
-        if hora not in horarios_disponibles(
-            fecha,
-            duracion,
-            tecnica,
-            negocio_id,
-        ):
-            st.error(
-                "Ese horario acaba de ocuparse. "
-                "Elige otro disponible."
-            )
-            st.session_state["hora_demo"] = None
+    st.subheader("3. Tus datos")
+    with st.form("booking"):
+        name = st.text_input("Nombre completo")
+        phone = st.text_input("WhatsApp / teléfono")
+        email = st.text_input("Correo (opcional)")
+        notes = st.text_area("Notas (opcional)")
+        accepted = st.checkbox("Confirmo que puedo cancelar o reprogramar hasta 2 horas antes.")
+        submit = st.form_submit_button("Reservar cita", type="primary")
+    if submit:
+        if len(name.strip()) < 2 or len(re.sub(r"\D", "", phone)) < 7 or not accepted:
+            st.error("Completa nombre y teléfono, y acepta la política de cambios.")
             return
+        end = chosen_start + timedelta(minutes=int(service["duration_minutes"]))
+        try:
+            appt_id, secret = create_booking_atomic(salon_id, salon, {
+                "staff_id": chosen_staff_id, "staff_name": chosen_staff["name"],
+                "service_id": service_id, "service_name": service["name"],
+                "desk_id": chosen_staff.get("desk_id", ""), "start_at": chosen_start,
+                "end_at": end, "price": float(service["price"]),
+                "client_name": name.strip(), "client_phone": phone.strip(),
+                "client_email": email.strip().lower(), "client_notes": notes.strip(),
+                "source": "public_web", "notification_status": "pending",
+            })
+            base = st.context.url.split("?", 1)[0]
+            manage_url = f"{base}?salon={slug}&manage={appt_id}&token={secret}"
+            st.success("¡Tu cita quedó reservada!")
+            st.info(f"Guarda este enlace para cancelar o reprogramar: {manage_url}")
+        except ValueError as exc:
+            st.error("Ese horario acaba de ocuparse. Elige otro." if str(exc) == "SLOT_TAKEN" else "La agenda se pausó; contacta a la dueña.")
 
-        if negocio_id:
-            guardar_cita(
-                {
-                    "business_id": negocio_id,
-                    "giro": giro,
-                    "nombre": nombre.strip(),
-                    "whatsapp": whatsapp.strip(),
-                    "servicio": servicio,
-                    "tecnica": tecnica,
-                    "duracion": duracion,
-                    "fecha": str(fecha),
-                    "hora": hora,
-                    "estado": "Pendiente",
-                    "comentarios": comentarios.strip(),
-                    "plan": negocio.get("plan", "Prueba 15 días"),
-                }
-            )
 
-            mensaje_exito = (
-                "¡Listo! Tu cita quedó confirmada."
-            )
+def manage_public_booking(slug: str, appointment_id: str, token: str):
+    found = public_salon_by_slug(slug)
+    if not found:
+        st.error("Enlace inválido.")
+        return
+    salon_id, salon = found
+    snap = salon_ref(salon_id).collection("appointments").document(appointment_id).get()
+    if not snap.exists:
+        st.error("La cita no existe.")
+        return
+    item = snap.to_dict()
+    st.title("Administrar cita")
+    st.write(f"**{item.get('service_name')}** con {item.get('staff_name')}")
+    st.write(item["start_at"].astimezone(ZoneInfo(salon.get("timezone", "America/Ciudad_Juarez"))).strftime("%d/%m/%Y · %I:%M %p"))
+    if item.get("status") not in {"booked", "confirmed"}:
+        st.info(f"Estado: {STATUS_LABEL.get(item.get('status'), item.get('status'))}")
+        return
+    if datetime.now(timezone.utc) > item["start_at"] - timedelta(hours=2):
+        st.warning("Ya faltan menos de 2 horas. Contacta directamente al salón para solicitar un cambio.")
+        return
+    if st.button("Cancelar cita"):
+        try:
+            manage_booking(salon_id, appointment_id, token, "cancel")
+            st.success("Cita cancelada.")
+            st.rerun()
+        except ValueError:
+            st.error("No fue posible validar el enlace.")
+    st.subheader("Reprogramar")
+    staff = {x["id"]: x for x in list_docs(salon_id, "staff")}.get(item.get("staff_id"))
+    service = {x["id"]: x for x in list_docs(salon_id, "services")}.get(item.get("service_id"))
+    if staff and service:
+        day = st.date_input("Nueva fecha", min_value=date.today(), max_value=date.today() + timedelta(days=90), key="reschedule_day")
+        starts = [x for x in available_starts(salon_id, staff, service, day, salon.get("timezone", "America/Ciudad_Juarez")) if x != item["start_at"]]
+        if starts:
+            chosen = st.selectbox("Nueva hora", starts, format_func=lambda x: x.strftime("%I:%M %p"))
+            if st.button("Confirmar nueva fecha", type="primary"):
+                try:
+                    manage_booking(salon_id, appointment_id, token, "reschedule", (chosen, chosen + timedelta(minutes=int(service["duration_minutes"]))))
+                    st.success("Cita reprogramada."); st.rerun()
+                except ValueError as exc:
+                    st.error("Ese horario acaba de ocuparse." if str(exc) == "SLOT_TAKEN" else "No fue posible validar el enlace.")
         else:
-            mensaje_exito = (
-                "Demostración completada. Para guardar citas "
-                "se necesita el enlace de un negocio registrado."
-            )
+            st.caption("No hay otros horarios disponibles ese día.")
 
-        st.success(mensaje_exito)
 
-        st.markdown(
-            f'<div class="booking-summary">'
-            f'<div class="eyebrow">Reserva confirmada</div>'
-            f'<strong>{texto_seguro(nombre)}</strong><br>'
-            f'<span>{texto_seguro(servicio)}</span><br>'
-            f'<span>{fecha_legible} · '
-            f'<span class="accent">{texto_seguro(hora)}</span>'
-            f'</span></div>',
-            unsafe_allow_html=True,
-        )
-
-    except Exception:
-        st.error(
-            "No fue posible guardar la cita. "
-            "Intenta nuevamente."
-        )
-
-
-def mostrar_planes():
-    st.markdown(
-        """
-        <section class="section">
-            <div class="eyebrow">Elige cómo crecer</div>
-            <h2>Una agenda que crece con tu negocio</h2>
-            <p>
-                Empieza simple y activa más herramientas
-                cuando las necesites.
-            </p>
-        </section>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    columnas = st.columns(3, gap="small")
-
-    for columna, plan in zip(columnas, PLANES):
-        with columna:
-            if st.button(
-                f"Conoce {plan}",
-                key=f"plan_{plan.lower()}",
-                use_container_width=True,
-            ):
-                st.session_state["plan"] = plan
-
-    plan = st.session_state.get("plan")
-
-    if not plan:
-        st.info("Elige un plan para conocer sus beneficios.")
-        return
-
-    beneficios = "".join(
-        f"<li>✓ {texto_seguro(beneficio)}</li>"
-        for beneficio in PLANES[plan]
-    )
-
-    st.markdown(
-        f'<section class="glass-card">'
-        f'<div class="eyebrow">{texto_seguro(plan)}</div>'
-        f'<h3>Esto es lo que puedes lograr</h3>'
-        f'<ul>{beneficios}</ul>'
-        f'</section>',
-        unsafe_allow_html=True,
-    )
-
-
-def mostrar_agenda_publica():
-    negocio_id = str(
-        st.query_params.get("business", "")
-    ).strip()
-
-    try:
-        negocio = (
-            obtener_negocio(negocio_id)
-            if negocio_id
-            else obtener_negocio_publico()
-        )
-    except Exception:
-        negocio = None
-        st.error(
-            "No fue posible consultar la información "
-            "del negocio."
-        )
-
-    if negocio_id and not negocio:
-        st.warning(
-            "El enlace de esta agenda no corresponde "
-            "a un negocio activo."
-        )
-
-    if negocio and dias_prueba_restantes(negocio) == 0:
-        st.warning(
-            "La prueba de esta agenda terminó. "
-            "Contacta a Nailcraft para reservar por WhatsApp."
-        )
-        mensaje = quote("Hola, quiero reservar una cita en Nailcraft.")
-        st.link_button(
-            "Reservar por WhatsApp",
-            f"https://wa.me/{WHATSAPP_NEGOCIO}?text={mensaje}",
-            use_container_width=True,
-        )
-        return
-
-    marca = BASE_DIR / "static" / "nailcraft-mark.png"
-    cabecera_izquierda, cabecera_derecha = st.columns([4, 1])
-    with cabecera_izquierda:
-        st.markdown(
-            "<h1 style='margin:.35rem 0 0'>Nailcraft</h1>"
-            "<p style='margin-top:0'>Nail studio · Ciudad Juárez</p>",
-            unsafe_allow_html=True,
-        )
-    with cabecera_derecha:
-        if marca.exists():
-            st.image(str(marca), width=72)
-
-    mostrar_experiencia(negocio)
-
-    st.markdown(
-        """
-        <section class="section">
-            <h2>Atención personalizada</h2>
-            <p>
-                Plaza de las Américas, local E-28 · Ciudad Juárez.
-            </p>
-        </section>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    mensaje = quote(
-        "Hola, tengo una pregunta sobre mi cita en Nailcraft."
-    )
-
-    st.link_button(
-        "Contactar a Nailcraft por WhatsApp",
-        f"https://wa.me/{WHATSAPP_NEGOCIO}?text={mensaje}",
-        use_container_width=True,
-    )
-
-    st.caption(
-        "Nailcraft · Tu momento, tus manos, tu estilo."
-    )
-
-
-# =====================================================
-# PANEL DEL DUEÑO
-# =====================================================
-
-def tarjeta_metrica(valor, etiqueta):
-    st.markdown(
-        f'<div class="metric-card">'
-        f'<div class="value">{texto_seguro(valor)}</div>'
-        f'<div class="label">{texto_seguro(etiqueta)}</div>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-
-def tarjeta_cita(cita, mostrar_fecha=True):
-    inicio = cita.get("inicio")
-    fecha_hora = "Fecha sin reconocer"
-
-    if inicio:
-        fecha_hora = (
-            inicio.strftime("%d/%m/%Y · %I:%M %p")
-            if mostrar_fecha
-            else inicio.strftime("%I:%M %p")
-        )
-
-    estado = cita.get("estado") or "Sin estado"
-
-    st.markdown(
-        f'<div class="appointment-card">'
-        f'<strong>{texto_seguro(fecha_hora)} · '
-        f'{texto_seguro(cita.get("nombre"))}</strong><br>'
-        f'<span>{texto_seguro(cita.get("servicio"))}</span><br>'
-        f'<span class="meta">'
-        f'{texto_seguro(cita.get("giro"))} · '
-        f'{texto_seguro(estado)} · '
-        f'{texto_seguro(cita.get("whatsapp"))}'
-        f'</span></div>',
-        unsafe_allow_html=True,
-    )
-
-
-def mostrar_inicio_dueno(citas):
-    ahora = datetime.now()
-    hoy = ahora.date()
-
-    validas = [
-        cita for cita in citas
-        if cita.get("inicio")
-    ]
-
-    citas_hoy = [
-        cita for cita in validas
-        if cita["inicio"].date() == hoy
-    ]
-
-    proximas = sorted(
-        (
-            cita for cita in validas
-            if cita["inicio"] >= ahora
-        ),
-        key=lambda cita: cita["inicio"],
-    )
-
-    clientes = {
-        (
-            str(cita.get("whatsapp", "")).strip()
-            or str(cita.get("nombre", "")).strip().lower()
-        )
-        for cita in citas
-        if (
-            str(cita.get("whatsapp", "")).strip()
-            or str(cita.get("nombre", "")).strip()
-        )
-    }
-
-    izquierda, derecha = st.columns(2, gap="small")
-
-    with izquierda:
-        tarjeta_metrica(len(citas_hoy), "Citas hoy")
-
-    with derecha:
-        tarjeta_metrica(len(clientes), "Clientes")
-
-    st.markdown("### Próximas citas")
-
-    if not proximas:
-        st.info("No hay próximas citas registradas.")
-        return
-
-    for cita in proximas[:8]:
-        tarjeta_cita(cita)
-
-
-def mostrar_agenda_dueno(citas):
-    st.markdown("### Agenda")
-
-    fecha_filtro = st.date_input(
-        "Ver día",
-        value=date.today(),
-        format="DD/MM/YYYY",
-        key="fecha_agenda_dueno",
-    )
-
-    del_dia = sorted(
-        (
-            cita for cita in citas
-            if cita.get("inicio")
-            and cita["inicio"].date() == fecha_filtro
-        ),
-        key=lambda cita: cita["inicio"],
-    )
-
-    if not del_dia:
-        st.info("No hay citas para este día.")
-        return
-
-    for cita in del_dia:
-        tarjeta_cita(cita, mostrar_fecha=False)
-
-
-def mostrar_clientes_dueno(citas):
-    st.markdown("### Clientes")
-    clientes = {}
-
-    for cita in citas:
-        whatsapp = str(cita.get("whatsapp", "")).strip()
-        nombre = str(cita.get("nombre", "")).strip()
-        clave = whatsapp or nombre.lower()
-
-        if not clave:
-            continue
-
-        cliente = clientes.setdefault(
-            clave,
-            {
-                "nombre": nombre,
-                "whatsapp": whatsapp,
-                "citas": 0,
-                "ultima": None,
-            },
-        )
-
-        cliente["citas"] += 1
-
-        if cita.get("inicio") and (
-            cliente["ultima"] is None
-            or cita["inicio"] > cliente["ultima"]
-        ):
-            cliente["ultima"] = cita["inicio"]
-
-    if not clientes:
-        st.info("Aún no hay clientes registrados.")
-        return
-
-    busqueda = st.text_input(
-        "Buscar cliente",
-        placeholder="Nombre o WhatsApp",
-        key="buscar_cliente_dueno",
-    ).strip().lower()
-
-    lista = sorted(
-        clientes.values(),
-        key=lambda cliente: cliente["nombre"].lower(),
-    )
-
-    if busqueda:
-        lista = [
-            cliente for cliente in lista
-            if busqueda in cliente["nombre"].lower()
-            or busqueda in cliente["whatsapp"].lower()
-        ]
-
-    if not lista:
-        st.info("No encontramos clientes con esa búsqueda.")
-        return
-
-    for cliente in lista:
-        ultima = (
-            cliente["ultima"].strftime("%d/%m/%Y")
-            if cliente["ultima"]
-            else "Sin fecha válida"
-        )
-
-        st.markdown(
-            f'<div class="appointment-card">'
-            f'<strong>{texto_seguro(cliente["nombre"])}</strong>'
-            f'<br><span>{texto_seguro(cliente["whatsapp"])}</span>'
-            f'<br><span class="meta">'
-            f'{cliente["citas"]} cita(s) · '
-            f'Última: {texto_seguro(ultima)}'
-            f'</span></div>',
-            unsafe_allow_html=True,
-        )
-
-
-def mostrar_ventas_dueno(citas):
-    st.markdown("### Ventas")
-
-    st.info(
-        "Nailcraft todavía no guarda precios. "
-        "Esta sección muestra actividad de reservaciones."
-    )
-
-    hoy = date.today()
-    mes_actual = (hoy.year, hoy.month)
-
-    citas_mes = [
-        cita for cita in citas
-        if cita.get("inicio")
-        and (
-            cita["inicio"].year,
-            cita["inicio"].month,
-        ) == mes_actual
-    ]
-
-    completadas = [
-        cita for cita in citas_mes
-        if str(cita.get("estado", "")).strip().lower()
-        in {"completada", "completado", "atendida"}
-    ]
-
-    izquierda, derecha = st.columns(2, gap="small")
-
-    with izquierda:
-        tarjeta_metrica(
-            len(citas_mes),
-            "Reservas este mes",
-        )
-
-    with derecha:
-        tarjeta_metrica(
-            len(completadas),
-            "Completadas",
-        )
-
-    conteo_servicios = {}
-
-    for cita in citas_mes:
-        servicio = (
-            str(cita.get("servicio", "")).strip()
-            or "Sin servicio"
-        )
-        conteo_servicios[servicio] = (
-            conteo_servicios.get(servicio, 0) + 1
-        )
-
-    st.markdown("### Servicios reservados")
-
-    if not conteo_servicios:
-        st.caption("Aún no hay reservaciones este mes.")
-        return
-
-    for servicio, cantidad in sorted(
-        conteo_servicios.items(),
-        key=lambda elemento: (-elemento[1], elemento[0]),
-    ):
-        st.markdown(
-            f"- **{texto_seguro(servicio)}:** {cantidad}"
-        )
-
-
-def mostrar_registro_negocio():
-    usuario = datos_usuario()
-    nombre_google = str(usuario.get("name", "")).strip()
-
-    st.markdown(
-        """
-        <section class="owner-header">
-            <div class="eyebrow">Primer acceso</div>
-            <h1>Configura tu negocio</h1>
-            <p>
-                Tu cuenta ya fue validada por Google.
-                Completa estos datos una sola vez.
-            </p>
-        </section>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    with st.form("registro_negocio"):
-        nombre = st.text_input(
-            "Nombre del negocio",
-            value="Nailcraft",
-            placeholder="Nombre comercial",
-        )
-
-        celular = st.text_input(
-            "WhatsApp del negocio",
-            placeholder="10 dígitos",
-            max_chars=10,
-        )
-
-        registrar = st.form_submit_button(
-            "Crear mi espacio privado",
-            use_container_width=True,
-            type="primary",
-        )
-
-    if not registrar:
-        return
-
-    if not nombre.strip():
-        st.error("Escribe el nombre del negocio.")
-        return
-
-    if not (celular.isdigit() and len(celular) == 10):
-        st.error("Ingresa un WhatsApp válido de 10 dígitos.")
-        return
-
-    try:
-        crear_negocio(nombre, celular)
-        st.success("Tu espacio privado fue creado.")
-        st.rerun()
-    except Exception:
-        st.error(
-            "No fue posible crear el negocio. "
-            "Intenta nuevamente."
-        )
-
-
-def mostrar_login_dueno():
-    st.markdown(
-        """
-        <section class="owner-header">
-            <div class="eyebrow">Área privada</div>
-            <h1>Nailcraft</h1>
-            <p>
-                Acceso privado mediante tu cuenta de Google.
-                Nailcraft no conoce ni almacena tu contraseña.
-            </p>
-        </section>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    if st.button(
-        "Continuar con Google",
-        use_container_width=True,
-        type="primary",
-        key="login_google",
-    ):
-        st.login()
-
-    st.caption(
-        "Google administra de forma privada tus credenciales."
-    )
-
-
-def cerrar_sesion_dueno():
-    st.logout()
-
-
-def mostrar_panel_dueno():
+def login_identity():
     if not st.user.is_logged_in:
-        mostrar_login_dueno()
-        return
-
-    if not usuario_es_dueno():
-        st.error(
-            "Esta cuenta de Google no está autorizada "
-            "para administrar Nailcraft."
-        )
-        if st.button("Cerrar sesión", use_container_width=True):
-            cerrar_sesion_dueno()
-        return
-
-    try:
-        negocio = obtener_negocio_del_dueno()
-    except Exception:
-        st.error(
-            "No fue posible conectar con Firebase. "
-            "Revisa la configuración e intenta nuevamente."
-        )
-        return
-
-    if not negocio:
-        mostrar_registro_negocio()
-        return
-
-    nombre_negocio = (
-        negocio.get("business_name") or "Mi negocio"
-    )
-
-    st.markdown(
-        f'<section class="owner-header">'
-        f'<div class="eyebrow">Panel del negocio</div>'
-        f'<h1>{texto_seguro(nombre_negocio)}</h1>'
-        f'<p>Las reservaciones de tu agenda, '
-        f'en un solo lugar.</p>'
-        f'</section>',
-        unsafe_allow_html=True,
-    )
-
-    dias = dias_prueba_restantes(negocio)
-    if dias:
-        st.info(f"Prueba gratuita: quedan {dias} día(s).")
-    else:
-        st.warning(
-            "La prueba gratuita terminó. Puedes consultar las citas "
-            "existentes, pero la agenda pública ya no acepta reservas."
-        )
-
-    enlace_publico = APP_URL
-
-    st.markdown("### Enlace de tu agenda")
-
-    st.code(enlace_publico, language=None)
-
-    st.link_button(
-        "Abrir mi agenda pública",
-        enlace_publico,
-        use_container_width=True,
-    )
-
-    if st.button(
-        "Cerrar sesión",
-        use_container_width=True,
-        key="cerrar_sesion_dueno",
-    ):
-        cerrar_sesion_dueno()
-
-    try:
-        citas = obtener_citas(negocio["id"])
-    except Exception:
-        st.error(
-            "No fue posible leer las citas de Firestore. "
-            "Intenta nuevamente."
-        )
-        return
-
-    seccion = st.radio(
-        "Sección del panel",
-        ["Inicio", "Agenda", "Clientes", "Ventas"],
-        horizontal=True,
-        label_visibility="collapsed",
-        key="seccion_dueno",
-    )
-
-    if seccion == "Inicio":
-        mostrar_inicio_dueno(citas)
-    elif seccion == "Agenda":
-        mostrar_agenda_dueno(citas)
-    elif seccion == "Clientes":
-        mostrar_clientes_dueno(citas)
-    else:
-        mostrar_ventas_dueno(citas)
+        st.title("Panel de propietaria")
+        st.write("Accede con la cuenta de Google autorizada para tu salón.")
+        if st.button("Continuar con Google", type="primary"):
+            st.login()
+        st.stop()
+    return st.user.email.lower()
 
 
-# =====================================================
-# NAVEGACIÓN PRINCIPAL
-# =====================================================
-
-def main():
-    aplicar_estilos()
-
-    st.session_state.setdefault("plan", None)
-    st.session_state.setdefault("vista_app", "publica")
-
-    if st.query_params.get("business"):
-        st.session_state["vista_app"] = "publica"
-    elif (
-        st.user.is_logged_in
-        and not st.session_state.get("_login_detectado")
-    ):
-        st.session_state["_login_detectado"] = True
-        st.session_state["vista_app"] = "dueno"
-
-    vista = st.session_state["vista_app"]
-
-    if vista == "publica":
-        izquierda, derecha = st.columns([2.2, 1.4])
-
-        with derecha:
-            if st.button(
-                "Acceso propietarios",
-                key="acceso_propietarios",
-                use_container_width=True,
-            ):
-                st.query_params.clear()
-                st.session_state["vista_app"] = "login"
+def admin_dashboard(salon_id: str, salon: dict):
+    tz = salon.get("timezone", "America/Ciudad_Juarez")
+    st.header("Agenda administrativa")
+    day = st.date_input("Día", value=date.today(), key="admin_day")
+    start = datetime.combine(day, time.min, ZoneInfo(tz))
+    items = appointments_between(salon_id, start, start + timedelta(days=1))
+    desks = {x["id"]: x for x in list_docs(salon_id, "desks")}
+    completed = [x for x in items if x.get("status") == "completed"]
+    active_desks = max(1, len([x for x in desks.values() if x.get("active")]))
+    capacity = active_desks * 8
+    ratio = len(completed) / capacity
+    color, label = ("🟢", "Alta") if ratio >= .7 else (("🟡", "Media") if ratio >= .35 else ("🔴", "Baja"))
+    a, b, c = st.columns(3)
+    a.metric("Citas del día", len(items)); b.metric("Completadas", len(completed)); c.metric("Ocupación completada", f"{color} {label} · {ratio:.0%}")
+    staff = staff_map(salon_id)
+    for item in items:
+        with st.expander(f"{item['start_at'].astimezone(ZoneInfo(tz)).strftime('%I:%M %p')} · {item.get('client_name')} · {item.get('service_name')}"):
+            st.write(f"Colaboradora: {staff.get(item.get('staff_id'), {}).get('name', item.get('staff_name', '—'))} · Tel: {item.get('client_phone', '—')}")
+            options = list(STATUS_LABEL)
+            current = item.get("status", "booked")
+            new = st.selectbox("Estado", options, index=options.index(current) if current in options else 0, format_func=STATUS_LABEL.get, key=f"status_{item['id']}")
+            if new != current:
+                salon_ref(salon_id).collection("appointments").document(item["id"]).update({"status": new, "updated_at": firestore.SERVER_TIMESTAMP})
                 st.rerun()
 
-        mostrar_agenda_publica()
 
-    elif vista == "login":
-        if st.user.is_logged_in:
-            st.session_state["vista_app"] = "dueno"
+def admin_staff(salon_id: str):
+    st.header("Colaboradoras y escritorios")
+    desks = sorted(list_docs(salon_id, "desks"), key=lambda x: x.get("number", 0))
+    for desk in desks:
+        enabled = st.toggle(desk.get("name", desk["id"]), value=desk.get("active", False), key=f"desk_{desk['id']}")
+        if enabled != desk.get("active", False):
+            upsert(salon_id, "desks", desk["id"], {"active": enabled})
             st.rerun()
+    services = list_docs(salon_id, "services")
+    existing = list_docs(salon_id, "staff")
+    choices = {x["id"]: x["name"] for x in existing}
+    selected = st.selectbox("Editar perfil", [""] + list(choices), format_func=lambda x: "Nueva colaboradora" if x == "" else choices[x])
+    item = next((x for x in existing if x["id"] == selected), {})
+    with st.form("staff_form"):
+        name = st.text_input("Nombre", item.get("name", ""))
+        phone = st.text_input("Teléfono", item.get("phone", ""))
+        active = st.checkbox("Perfil activo", item.get("active", True))
+        desk_ids = [x["id"] for x in desks if x.get("active")]
+        desk_id = st.selectbox("Escritorio", desk_ids, index=desk_ids.index(item.get("desk_id")) if item.get("desk_id") in desk_ids else 0) if desk_ids else ""
+        service_ids = st.multiselect("Servicios", [x["id"] for x in services], default=item.get("service_ids", []), format_func=lambda x: next((s["name"] for s in services if s["id"] == x), x))
+        photo = st.file_uploader("Foto", type=["jpg", "jpeg", "png", "webp"])
+        schedule = {}
+        st.caption("Horario semanal")
+        for i, day_name in enumerate(DAYS):
+            old = (item.get("schedule") or {}).get(str(i), {})
+            cols = st.columns([2, 2, 2])
+            works = cols[0].checkbox(day_name, bool(old), key=f"works_{selected}_{i}")
+            start = cols[1].time_input("Entrada", time.fromisoformat(old.get("start", "09:00")), key=f"start_{selected}_{i}", label_visibility="collapsed")
+            end = cols[2].time_input("Salida", time.fromisoformat(old.get("end", "18:00")), key=f"end_{selected}_{i}", label_visibility="collapsed")
+            if works: schedule[str(i)] = {"start": start.strftime("%H:%M"), "end": end.strftime("%H:%M")}
+        save = st.form_submit_button("Guardar perfil", type="primary")
+    if save:
+        values = {"name": name.strip(), "phone": phone.strip(), "active": active, "desk_id": desk_id, "service_ids": service_ids, "schedule": schedule}
+        if photo:
+            media = upload_image(salon_id, "staff", photo)
+            values.update({"photo_url": media["url"], "photo_path": media["storage_path"]})
+        upsert(salon_id, "staff", selected or None, values)
+        st.success("Perfil guardado."); st.rerun()
 
-        if st.button(
-            "← Volver a la agenda",
-            key="volver_agenda",
-        ):
-            st.session_state["vista_app"] = "publica"
-            st.rerun()
 
-        mostrar_login_dueno()
+def admin_services(salon_id: str):
+    st.header("Catálogo de servicios")
+    items = list_docs(salon_id, "services")
+    choices = {x["id"]: x["name"] for x in items}
+    selected = st.selectbox("Editar", [""] + list(choices), format_func=lambda x: "Nuevo servicio" if not x else choices[x])
+    item = next((x for x in items if x["id"] == selected), {})
+    with st.form("service"):
+        name = st.text_input("Servicio", item.get("name", ""))
+        description = st.text_area("Descripción", item.get("description", ""))
+        price = st.number_input("Precio", min_value=0.0, value=float(item.get("price", 0)), step=10.0)
+        duration = st.number_input("Duración (minutos)", min_value=15, max_value=480, value=int(item.get("duration_minutes", 60)), step=15)
+        active = st.checkbox("Disponible", item.get("active", True))
+        save = st.form_submit_button("Guardar", type="primary")
+    if save and name.strip():
+        upsert(salon_id, "services", selected or None, {"name": name.strip(), "description": description.strip(), "price": price, "duration_minutes": duration, "active": active})
+        st.success("Servicio guardado."); st.rerun()
 
-    elif vista == "dueno":
-        mostrar_panel_dueno()
 
-    else:
-        st.session_state["vista_app"] = "publica"
-        st.rerun()
+def admin_gallery(salon_id: str):
+    st.header("Galería")
+    usage = salon_ref(salon_id).collection("usage").document(date.today().strftime("%Y-%m")).get().to_dict() or {}
+    st.caption(f"10 espacios · {usage.get('gallery_changes', 0)}/3 operaciones usadas este mes")
+    items = list_docs(salon_id, "gallery")
+    cols = st.columns(5)
+    for i, item in enumerate(items):
+        with cols[i % 5]:
+            st.image(item["url"], use_container_width=True)
+            if st.button("Eliminar", key=f"del_{item['id']}"):
+                try:
+                    gallery_change(salon_id, "delete", image_id=item["id"])
+                    delete_image(item.get("storage_path")); st.rerun()
+                except ValueError: st.error("Límite mensual alcanzado.")
+    upload = st.file_uploader("Agregar foto", type=["jpg", "jpeg", "png", "webp"], key="gallery_upload")
+    if upload and st.button("Subir a galería", type="primary"):
+        media = None
+        try:
+            media = upload_image(salon_id, "gallery", upload)
+            gallery_change(salon_id, "add", media)
+            st.success("Foto agregada."); st.rerun()
+        except ValueError as exc:
+            if media: delete_image(media.get("storage_path"))
+            st.error("La galería está llena." if str(exc) == "CAPACITY_LIMIT" else "Ya se usaron las 3 operaciones del mes.")
 
 
-if __name__ == "__main__":
-    main()
+def admin_settings(salon_id: str, salon: dict):
+    st.header("Configuración del salón")
+    with st.form("settings"):
+        name = st.text_input("Nombre", salon.get("name", ""))
+        phone = st.text_input("Teléfono de la dueña", salon.get("owner_phone", ""))
+        timezone_name = st.text_input("Zona horaria", salon.get("timezone", "America/Ciudad_Juarez"))
+        save = st.form_submit_button("Guardar", type="primary")
+    if save:
+        salon_ref(salon_id).update({"name": name.strip(), "owner_phone": phone.strip(), "timezone": timezone_name.strip(), "updated_at": firestore.SERVER_TIMESTAMP})
+        st.success("Configuración guardada."); st.rerun()
+    st.info(f"Suscripción: {salon.get('subscription_status', 'pendiente')} · vigencia: {salon.get('subscription_end', 'sin fecha')}")
+    st.subheader("Automatización WhatsApp")
+    st.write("Las citas se guardan con `notification_status = pending`. Un proceso externo debe leer esos eventos y enviarlos a la dueña mediante un proveedor autorizado. Esta versión no afirma ni simula envíos automáticos.")
+
+
+def owner_panel():
+    email = login_identity()
+    master = email in [x.lower() for x in st.secrets.get("platform", {}).get("master_emails", [])]
+    salons = all_salons() if master else salons_for_owner(email)
+    if master:
+        with st.sidebar.expander("Alta de salón"):
+            with st.form("new_salon"):
+                name = st.text_input("Nombre")
+                slug = st.text_input("Subdominio / identificador")
+                owner = st.text_input("Google de la propietaria")
+                create = st.form_submit_button("Autorizar y crear")
+            if create:
+                if not name.strip() or not re.fullmatch(r"[a-z0-9-]{3,40}", slug.strip().lower()) or "@" not in owner:
+                    st.error("Completa nombre, correo y un identificador de 3 a 40 caracteres (letras, números o guiones).")
+                else:
+                    try:
+                        seed_salon(name, slug, owner, st.secrets.get("platform", {}).get("default_timezone", "America/Ciudad_Juarez")); st.rerun()
+                    except ValueError:
+                        st.error("Ese identificador ya está en uso.")
+    if not salons:
+        st.error("Tu cuenta Google no está autorizada para ningún salón.")
+        if st.button("Cerrar sesión"): st.logout()
+        return
+    names = {sid: data.get("name", sid) for sid, data in salons}
+    salon_id = st.sidebar.selectbox("Salón", names, format_func=names.get)
+    salon = next(data for sid, data in salons if sid == salon_id)
+    st.sidebar.write(email)
+    if st.sidebar.button("Cerrar sesión"): st.logout()
+    page = st.sidebar.radio("Sección", ["Agenda", "Colaboradoras", "Servicios", "Galería", "Configuración"])
+    {"Agenda": admin_dashboard, "Colaboradoras": admin_staff, "Servicios": admin_services, "Galería": admin_gallery}.get(page, lambda sid: admin_settings(sid, salon))(salon_id)
+
+
+mode = qp("mode")
+slug = qp("salon")
+if slug and qp("manage"):
+    manage_public_booking(slug, qp("manage"), qp("token"))
+elif slug:
+    public_page(slug)
+else:
+    owner_panel()
