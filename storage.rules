@@ -1,0 +1,7 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Las cargas y lecturas pasan por el servidor, que valida el salón activo.
+    match /{allPaths=**} { allow read, write: if false; }
+  }
+}
