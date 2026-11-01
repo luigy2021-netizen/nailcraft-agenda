@@ -1,5 +1,5 @@
-streamlit==1.56.0
-gspread
-google-auth
-Authlib>=1.6.11
-firebase-admin>=6.5.0
+streamlit>=1.42,<2
+firebase-admin>=6.5,<8
+google-cloud-firestore>=2.16,<3
+google-cloud-storage>=2.17,<4
+Pillow>=10,<13
