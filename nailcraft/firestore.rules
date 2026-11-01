@@ -1,0 +1,8 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // La aplicación usa exclusivamente Firebase Admin desde el servidor.
+    // Ningún navegador puede leer o escribir Firestore de forma directa.
+    match /{document=**} { allow read, write: if false; }
+  }
+}
