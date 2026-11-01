@@ -144,30 +144,20 @@ def manage_booking(salon_id: str, appointment_id: str, secret: str, action: str,
         transact(database.transaction())
 
 
-def gallery_change(salon_id: str, operation: str, image: dict[str, Any] | None = None, image_id: str | None = None) -> None:
-    """Cuenta cada alta, reemplazo o baja como una operación mensual."""
-    month = date.today().strftime("%Y-%m")
-    counter = salon_ref(salon_id).collection("usage").document(month)
-    transaction = db().transaction()
+def get_collage(salon_id: str) -> dict[str, Any] | None:
+    snap = salon_ref(salon_id).collection("presentation").document("collage").get()
+    return snap.to_dict() if snap.exists else None
 
-    @firestore.transactional
-    def transact(tx):
-        usage = counter.get(transaction=tx).to_dict() or {}
-        if int(usage.get("gallery_changes", 0)) >= 3:
-            raise ValueError("MONTHLY_LIMIT")
-        gallery = salon_ref(salon_id).collection("gallery")
-        if operation == "add":
-            if len(list(gallery.stream(transaction=tx))) >= 10:
-                raise ValueError("CAPACITY_LIMIT")
-            ref = gallery.document()
-            tx.set(ref, {**(image or {}), "salon_id": salon_id, "created_at": firestore.SERVER_TIMESTAMP})
-        elif operation == "replace" and image_id:
-            tx.set(gallery.document(image_id), {**(image or {}), "salon_id": salon_id, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
-        elif operation == "delete" and image_id:
-            tx.delete(gallery.document(image_id))
-        tx.set(counter, {"gallery_changes": firestore.Increment(1), "month": month}, merge=True)
 
-    transact(transaction)
+def save_collage(salon_id: str, image: dict[str, Any]) -> None:
+    salon_ref(salon_id).collection("presentation").document("collage").set(
+        {**image, "salon_id": salon_id, "updated_at": firestore.SERVER_TIMESTAMP},
+        merge=True,
+    )
+
+
+def remove_collage(salon_id: str) -> None:
+    salon_ref(salon_id).collection("presentation").document("collage").delete()
 
 
 def seed_salon(name: str, slug: str, owner_email: str, timezone_name: str) -> str:
